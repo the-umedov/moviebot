@@ -11,6 +11,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ChatJoinRequest,
 )
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.fsm.context import FSMContext
@@ -23,25 +24,27 @@ from aiogram.fsm.state import State, StatesGroup
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# Siz bergan kanal invite link
 CHANNEL_INVITE = os.getenv("CHANNEL_INVITE", "https://t.me/+JBZQtaUKyRFiYmQy").strip()
-
-# Private kanal bo‘lsa: -100... formatda bo‘ladi
-# Public kanal bo‘lsa: @kanalusername ham bo‘lishi mumkin
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # -100... yoki @username (tavsiya: -100...)
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN topilmadi. Railway Variables ga BOT_TOKEN qo‘ying.")
+    raise RuntimeError("BOT_TOKEN topilmadi. Railway Variables ga BOT_TOKEN qo'ying.")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL topilmadi. Railway Postgres plugin qo‘shing va DATABASE_URL ni Variables ga ulang.")
+    raise RuntimeError("DATABASE_URL topilmadi. Postgresni moviebotga Variable Reference qiling.")
 if not CHANNEL_ID:
-    raise RuntimeError("CHANNEL_ID topilmadi. Railway Variables ga CHANNEL_ID qo‘ying (masalan: -100...).")
+    raise RuntimeError("CHANNEL_ID topilmadi. Railway Variables ga CHANNEL_ID qo'ying (masalan: -100...).")
 
-# kanal ID ni int yoki str ko‘rinishda ishlatamiz
 try:
     CHANNEL_ID_CAST = int(CHANNEL_ID)
 except ValueError:
-    CHANNEL_ID_CAST = CHANNEL_ID  # masalan "@mychannel"
+    CHANNEL_ID_CAST = CHANNEL_ID  # public bo'lsa: "@kanal"
+
+
+# ======================
+# BOT / DISPATCHER
+# ======================
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 
 
 # ======================
@@ -91,7 +94,7 @@ async def get_movie(code: str) -> Optional[Tuple[str, str, str]]:
     assert pool is not None
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT title, kind, payload FROM movies WHERE code = $1",
+            "SELECT title, kind, payload FROM movies WHERE code=$1",
             code
         )
         if not row:
@@ -109,7 +112,6 @@ async def list_movies() -> List[Tuple[str, str]]:
 # UI
 # ======================
 def main_kb() -> InlineKeyboardMarkup:
-    # Siz “Kino qo‘shish” tugmasini o‘chirgansiz — shu holatda qoldirdim.
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎬 Barcha kinolar", callback_data="all_movies")],
@@ -130,15 +132,20 @@ def join_kb() -> InlineKeyboardMarkup:
 # ======================
 async def is_subscribed(user_id: int) -> bool:
     """
-    Private kanal bo‘lsa: bot kanalda ADMIN bo‘lishi shart.
-    Aks holda getChatMember ishlamasligi mumkin.
+    Private kanal bo'lsa bot admin bo'lishi shart.
+    Ba'zan status 'restricted' bo'lishi mumkin — is_member=True bo'lsa a'zo hisoblaymiz.
     """
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_ID_CAST, user_id=user_id)
-        # status: creator/administrator/member/left/kicked/restricted
-        return member.status in ("creator", "administrator", "member")
+
+        if member.status in ("creator", "administrator", "member"):
+            return True
+
+        if member.status == "restricted":
+            return bool(getattr(member, "is_member", False))
+
+        return False
     except Exception:
-        # bot kanalda admin emas / chat_id noto‘g‘ri / telegram error
         return False
 
 async def require_subscribed(message: Message) -> bool:
@@ -148,14 +155,45 @@ async def require_subscribed(message: Message) -> bool:
     ok = await is_subscribed(user_id)
     if not ok:
         await message.answer(
-            "❗ Botdan foydalanish uchun avval kanalga a’zo bo‘ling, so‘ng ✅ Tekshirish bosing.",
+            "❗ Botdan foydalanish uchun avval kanalga a’zo bo‘ling.\n"
+            "Agar kanalda 'request' bo'lsa, request yuboring — bot avtomatik tasdiqlaydi.\n"
+            "So‘ng ✅ Tekshirish bosing.",
             reply_markup=join_kb()
         )
     return ok
 
 
 # ======================
-# FSM
+# AUTO APPROVE JOIN REQUEST
+# ======================
+@dp.chat_join_request()
+async def on_join_request(req: ChatJoinRequest):
+    """
+    Kanalga join request kelsa — avtomatik approve qilamiz.
+    Shart: bot kanalga ADMIN va join requestlarni tasdiqlash huquqi bo'lsin.
+    """
+    try:
+        # Faqat bizning kanal bo'lsa (CHANNEL_ID int bo'lsa qat'iy tekshiradi)
+        if isinstance(CHANNEL_ID_CAST, int) and req.chat.id != CHANNEL_ID_CAST:
+            return
+
+        await bot.approve_chat_join_request(chat_id=req.chat.id, user_id=req.from_user.id)
+
+        # Foydalanuvchiga DM (agar yoqilgan bo'lsa)
+        try:
+            await bot.send_message(
+                req.from_user.id,
+                "✅ Request qabul qilindi. Endi botdan foydalanishingiz mumkin.\n/start bosing."
+            )
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[JOIN_REQUEST_ERR] {e}")
+
+
+# ======================
+# FSM (kino qo‘shish)
 # ======================
 class AddMovie(StatesGroup):
     code = State()
@@ -163,7 +201,6 @@ class AddMovie(StatesGroup):
     content = State()
 
 CODE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-
 
 async def send_movie(message: Message, title: str, kind: str, payload: str):
     if kind == "link":
@@ -178,28 +215,15 @@ async def send_movie(message: Message, title: str, kind: str, payload: str):
 
 
 # ======================
-# BOT
+# HANDLERS
 # ======================
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
-
-
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
-    # start ham subscription talab qiladi
-    user_id = message.from_user.id if message.from_user else 0
-    if user_id and not await is_subscribed(user_id):
-        await message.answer(
-            "❗ Botdan foydalanish uchun avval kanalga a’zo bo‘ling.",
-            reply_markup=join_kb()
-        )
+    if not await require_subscribed(message):
         return
 
     name = message.from_user.first_name if message.from_user else "Foydalanuvchi"
-    await message.answer(
-        f'Salom, "{name}" kod yuborishingiz mumkin.',
-        reply_markup=main_kb()
-    )
+    await message.answer(f'Salom, "{name}" kod yuborishingiz mumkin.', reply_markup=main_kb())
 
 
 @dp.callback_query(F.data == "check_sub")
@@ -218,10 +242,10 @@ async def check_sub_cb(call: CallbackQuery):
 
 @dp.callback_query(F.data == "all_movies")
 async def all_movies_cb(call: CallbackQuery):
-    # subscription check
     if not await is_subscribed(call.from_user.id):
         await call.message.answer(
-            "❗ Botdan foydalanish uchun avval kanalga a’zo bo‘ling.",
+            "❗ Avval kanalga a’zo bo‘ling. Request yuborsangiz bot avtomatik tasdiqlaydi.\n"
+            "So‘ng ✅ Tekshirish bosing.",
             reply_markup=join_kb()
         )
         await call.answer()
@@ -234,28 +258,25 @@ async def all_movies_cb(call: CallbackQuery):
         return
 
     lines = [f"{code} — {title}" for code, title in rows]
-
-    # Ko‘p bo‘lsa bo‘lib yuboramiz
     chunk = []
     max_lines = 60
+
     for line in lines:
         chunk.append(line)
         if len(chunk) >= max_lines:
             await call.message.answer("📃 <b>Kinolar ro‘yxati:</b>\n" + "\n".join(chunk), parse_mode="HTML")
             chunk = []
-
     if chunk:
         await call.message.answer("📃 <b>Kinolar ro‘yxati:</b>\n" + "\n".join(chunk), parse_mode="HTML")
 
     await call.answer()
 
 
-# Hamma /kino bilan kino qo‘shishi mumkin, lekin kanalga a’zo bo‘lish shart
+# /kino — hamma qo‘sha oladi (lekin a'zo bo'lish shart)
 @dp.message(Command("kino"))
 async def add_movie_cmd(message: Message, state: FSMContext):
     if not await require_subscribed(message):
         return
-
     await state.set_state(AddMovie.code)
     await message.answer("Kino kodini yuboring (masalan: A12 yoki kino_7):")
 
@@ -324,7 +345,7 @@ async def add_movie_content(message: Message, state: FSMContext):
     await message.answer("Link (https://...) yoki video yuboring.")
 
 
-# Kod yuborsa kino chiqaradi (lekin kanalga a’zo bo‘lish shart)
+# Kod yuborsa kino chiqaradi (a'zo bo'lish shart)
 @dp.message()
 async def handle_codes(message: Message):
     if not await require_subscribed(message):
@@ -336,28 +357,18 @@ async def handle_codes(message: Message):
 
     row = await get_movie(text)
     if not row:
-        return  # topilmasa jim turadi
+        return
+
     title, kind, payload = row
     await send_movie(message, title, kind, payload)
 
 
-# Kanal ID olish uchun yordamchi buyruq (kanaldan post forward qiling, keyin /channelid yozing)
-@dp.message(Command("channelid"))
-async def channel_id_help(message: Message):
-    # forward qilingan postni tekshiradi
-    if message.forward_from_chat:
-        await message.answer(f"Kanal ID: <code>{message.forward_from_chat.id}</code>", parse_mode="HTML")
-    else:
-        await message.answer("Kanal postini botga FORWARD qiling, keyin /channelid yozing.")
-
-
 # ======================
-# MAIN
+# MAIN (barqaror polling)
 # ======================
 async def main():
     await init_db()
 
-    # polling/webhook konflikt bo‘lmasin
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
