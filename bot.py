@@ -82,7 +82,7 @@ def main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎬 Barcha kinolar", callback_data="all_movies")],
-            [InlineKeyboardButton(text="➕ Kino qo‘shish", callback_data="add_movie")],
+           
         ]
     )
 
