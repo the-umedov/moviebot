@@ -1,5 +1,6 @@
-import asyncio
+import os
 import re
+import asyncio
 from typing import Optional, Tuple
 
 import aiosqlite
@@ -16,23 +17,18 @@ from aiogram.types import (
 )
 
 # ======================
-# CONFIG
+# CONFIG (Railway Variables)
 # ======================
-
-import os
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DB_PATH = os.getenv("DB_PATH", "movies.db").strip()
+
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN topilmadi.")
-
-
-if not BOT_TOKEN or "BU_YERGA" in BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN ni bot.py ichida to‘g‘ri qo‘ying.")
+    raise RuntimeError("BOT_TOKEN topilmadi. Railway Variables ga BOT_TOKEN qo‘ying.")
 
 
 # ======================
 # DB
 # ======================
-
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS movies (
     code TEXT PRIMARY KEY,
@@ -82,7 +78,6 @@ async def list_movies() -> list[Tuple[str, str]]:
 # ======================
 # UI
 # ======================
-
 def main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -93,9 +88,8 @@ def main_kb() -> InlineKeyboardMarkup:
 
 
 # ======================
-# FSM
+# FSM (kino qo‘shish)
 # ======================
-
 class AddMovie(StatesGroup):
     code = State()
     title = State()
@@ -109,7 +103,6 @@ async def send_movie(message: Message, title: str, kind: str, payload: str):
         await message.answer(f"🎬 <b>{title}</b>\n🔗 {payload}", parse_mode="HTML")
         return
 
-    # Telegram video file_id
     await message.answer(f"🎬 <b>{title}</b>\n✅ Kino topildi, yuboryapman...", parse_mode="HTML")
     try:
         await message.answer_video(payload, caption=title)
@@ -120,7 +113,6 @@ async def send_movie(message: Message, title: str, kind: str, payload: str):
 # ======================
 # BOT
 # ======================
-
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
@@ -144,16 +136,14 @@ async def all_movies_cb(call: CallbackQuery):
 
     lines = [f"{code} — {title}" for code, title in rows]
 
-    # ko‘p bo‘lsa bo‘lib yuboradi
+    # Ko‘p bo‘lsa bo‘lib yuboramiz
     chunk = []
     max_lines = 60
-
     for line in lines:
         chunk.append(line)
         if len(chunk) >= max_lines:
             await call.message.answer("📃 <b>Kinolar ro‘yxati:</b>\n" + "\n".join(chunk), parse_mode="HTML")
             chunk = []
-
     if chunk:
         await call.message.answer("📃 <b>Kinolar ro‘yxati:</b>\n" + "\n".join(chunk), parse_mode="HTML")
 
@@ -197,8 +187,8 @@ async def add_movie_title(message: Message, state: FSMContext):
     await state.set_state(AddMovie.content)
     await message.answer(
         "Endi kino <b>link</b> yuboring yoki kinoni Telegramga <b>video</b> qilib tashlang.\n"
-        "✅ Link bo‘lsa: https://... yuboring\n"
-        "✅ Video bo‘lsa: videoni shu chatga yuboring.",
+        "✅ Link: https://...\n"
+        "✅ Video: shu chatga video yuboring",
         parse_mode="HTML"
     )
 
@@ -209,7 +199,7 @@ async def add_movie_content(message: Message, state: FSMContext):
     code = data["code"]
     title = data["title"]
 
-    # 1) Link
+    # Link
     text = (message.text or "").strip()
     if text.startswith("http://") or text.startswith("https://"):
         await upsert_movie(code, title, "link", text)
@@ -217,7 +207,7 @@ async def add_movie_content(message: Message, state: FSMContext):
         await message.answer(f"✅ Saqlandi!\nKod: {code}\nNomi: {title}\nTuri: link", reply_markup=main_kb())
         return
 
-    # 2) Telegram video
+    # Video
     if message.video:
         file_id = message.video.file_id
         await upsert_movie(code, title, "telegram", file_id)
@@ -228,7 +218,7 @@ async def add_movie_content(message: Message, state: FSMContext):
     await message.answer("Link (https://...) yoki video yuboring.")
 
 
-# Foydalanuvchi kod yuborsa kino chiqadi
+# Kod yuborsa kino chiqaradi
 @dp.message()
 async def handle_codes(message: Message):
     text = (message.text or "").strip()
@@ -243,25 +233,35 @@ async def handle_codes(message: Message):
 
 
 # ======================
-# MAIN (UZILSA HAM QAYTA ULANDI)
+# MAIN (Railway uchun barqaror)
 # ======================
-
 async def main():
     await init_db()
 
-    # Polling/webhook konflikt bo‘lmasin:
-    await bot.delete_webhook(drop_pending_updates=True)
+    # Polling/webhook konflikt bo‘lmasin
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print(f"[WARN] delete_webhook ishlamadi: {e}")
 
-    while True:
-        try:
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-        except TelegramNetworkError as e:
-            print(f"[NET] {e} -> 5 soniyada qayta ulanaman...")
-            await asyncio.sleep(5)
-        except Exception as e:
-            print(f"[ERR] {e} -> 5 soniyada qayta ishga tushaman...")
-            await asyncio.sleep(5)
+    try:
+        while True:
+            try:
+                await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            except TelegramNetworkError as e:
+                print(f"[NET] {e} -> 5 soniyada qayta ulanaman...")
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[ERR] {e} -> 5 soniyada qayta ishga tushaman...")
+                await asyncio.sleep(5)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
